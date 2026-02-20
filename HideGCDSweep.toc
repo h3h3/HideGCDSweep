@@ -1,8 +1,8 @@
 ## Interface: 120001
 ## Title: Hide GCD Sweep
 ## Notes: Hides the cooldown swipe/sweep animation on Blizzard's Cooldown Manager icons (Essential, Utility, Buff trackers).
-## Author: Custom
-## Version: 1.0.0
 ## IconTexture: Interface\Icons\Spell_Holy_BorrowedTime
+## Version: @project-version@
+## X-Curse-Project-ID: 1467142
 
 HideGCDSweep.lua
