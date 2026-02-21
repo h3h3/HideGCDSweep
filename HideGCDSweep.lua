@@ -16,6 +16,7 @@ local ADDON_NAME = ...
 -- ============================================================================
 
 local HIDE_EDGE = true   -- Also hide the bright edge line on the GCD sweep
+local DEBUG     = false  -- Set to true to print debug info to chat
 
 -- ============================================================================
 -- BLIZZARD CDM VIEWER DEFINITIONS
@@ -33,6 +34,53 @@ local VIEWERS = {
 
 local hookedCooldowns = {}   -- cooldown frame → true  (already hooked)
 local chargeSpellCache = {}  -- [spellID] = true for spells known to have charges
+
+-- ============================================================================
+-- DEBUG HELPER
+-- ============================================================================
+
+local function D(...)
+    if not DEBUG then return end
+    local parts = {}
+    for i = 1, select("#", ...) do
+        local v = select(i, ...)
+        if v == nil then
+            parts[#parts + 1] = "nil"
+        elseif issecretvalue and issecretvalue(v) then
+            parts[#parts + 1] = "<secret>"
+        else
+            parts[#parts + 1] = tostring(v)
+        end
+    end
+    print("|cff00ccff[HGS]|r " .. table.concat(parts, " "))
+end
+
+-- ============================================================================
+-- PRE-SCAN: Populate chargeSpellCache from spellbook (runs out of combat)
+-- ============================================================================
+
+local function PreScanChargeSpells()
+    if not C_SpellBook or not C_Spell or not C_Spell.GetSpellCharges then return end
+    local bankEnum = Enum and Enum.SpellBookSpellBank and Enum.SpellBookSpellBank.Player
+    if not bankEnum or not C_SpellBook.GetNumSpellBookItems then return end
+
+    local count = 0
+    local numSpells = C_SpellBook.GetNumSpellBookItems(bankEnum) or 0
+    for i = 1, numSpells do
+        local ok, info = pcall(C_SpellBook.GetSpellBookItemInfo, i, bankEnum)
+        if ok and info and info.spellID then
+            local ok2, chargeInfo = pcall(C_Spell.GetSpellCharges, info.spellID)
+            if ok2 and chargeInfo then
+                local max = chargeInfo.maxCharges
+                if max and type(max) == "number" and max > 1 then
+                    chargeSpellCache[info.spellID] = true
+                    count = count + 1
+                end
+            end
+        end
+    end
+    D("PreScan: cached", count, "charge spells")
+end
 
 -- ============================================================================
 -- GCD FILTER CURVE  (secret-safe, Midnight pattern from TweaksUI)
@@ -62,6 +110,35 @@ local function GetGCDFilterCurve()
     end)
     if ok and curve then gcdFilterCurve = curve end
     return gcdFilterCurve
+end
+
+-- ============================================================================
+-- NEAR-ZERO CURVE  (secret-safe)
+--
+-- Distinguishes "essentially zero" cooldown (fully charged) from an active
+-- recharge that still has time left:
+--   remaining ≤ 0.1 s  →  0  (no active recharge – fully charged)
+--   remaining > 0.1 s  →  1  (recharge in progress)
+-- ============================================================================
+
+local nearZeroCurve
+
+local function GetNearZeroCurve()
+    if nearZeroCurve then return nearZeroCurve end
+    if not C_CurveUtil or not C_CurveUtil.CreateCurve then return nil end
+    if not Enum or not Enum.LuaCurveType then return nil end
+
+    local ok, curve = pcall(function()
+        local c = C_CurveUtil.CreateCurve()
+        c:SetType(Enum.LuaCurveType.Linear)
+        c:AddPoint(0,    0)   -- 0 s remaining    → 0  (fully charged)
+        c:AddPoint(0.1,  0)   -- 0.1 s remaining  → 0  (essentially zero)
+        c:AddPoint(0.11, 1)   -- 0.11 s            → 1  (recharge active)
+        c:AddPoint(600,  1)   -- 10 min            → 1
+        return c
+    end)
+    if ok and curve then nearZeroCurve = curve end
+    return nearZeroCurve
 end
 
 -- ============================================================================
@@ -105,6 +182,29 @@ local function IsDurationLongerThanGCD(dObj)
 end
 
 -- ============================================================================
+-- SECRET-SAFE NEAR-ZERO CHECK
+-- Returns true (remaining ≤ 0.1 s — essentially zero), false (> 0.1 s), or nil
+-- ============================================================================
+
+local function IsDurationNearZero(dObj)
+    local curve = GetNearZeroCurve()
+    if not curve or not C_StringUtil or not C_StringUtil.TruncateWhenZero then return nil end
+
+    local ok, result = pcall(dObj.EvaluateRemainingDuration, dObj, curve)
+    if not ok or result == nil then return nil end
+
+    local ok2, str = pcall(C_StringUtil.TruncateWhenZero, result)
+    if not ok2 then return nil end
+
+    -- str is secret → curve returned 1 → remaining > 0.1 s → recharge active
+    -- str is ""     → curve returned 0 → remaining ≤ 0.1 s → fully charged
+    if issecretvalue and issecretvalue(str) then
+        return false
+    end
+    return true
+end
+
+-- ============================================================================
 -- IS THIS COOLDOWN EVENT A GCD?
 -- Returns true  → GCD (hide the sweep)
 --         false → real CD (allow sweep)
@@ -138,36 +238,36 @@ local function IsGCD(spellID, durationObject, hookDur)
             local maxReadable = max ~= nil and type(max) == "number"
                 and not (issecretvalue and issecretvalue(max))
 
-            if curReadable and maxReadable and max > 1 then
-                -- PATH A: readable → cache and branch directly
-                chargeSpellCache[spellID] = true
-                if cur < max then
-                    return false  -- recharge ticking → show swipe
+            if curReadable and maxReadable then
+                if max > 1 then
+                    -- PATH A: readable multi-charge spell → cache and branch
+                    chargeSpellCache[spellID] = true
+                    if cur < max then
+                        return false, "CHG-A:recharging(" .. cur .. "/" .. max .. ")"
+                    end
+                    return true, "CHG-A:full(" .. cur .. "/" .. max .. ")"
                 end
-                return true  -- fully charged → CD shown is GCD
-            end
-
-            -- PATH B: secret values → use cache + charge Duration Object
-            if chargeSpellCache[spellID] then
-                -- We know this is a charge spell; check if recharge is active
+                -- max == 1 → not a real charge spell, skip charge logic
+            elseif chargeSpellCache[spellID] then
+                -- PATH B: secret values, but we previously confirmed max > 1
+                local rechargeDetected = false
                 if C_Spell.GetSpellChargesCooldownDuration then
                     local ok2, chargeDObj = pcall(C_Spell.GetSpellChargesCooldownDuration, spellID)
                     if ok2 and chargeDObj then
-                        local isLong = IsDurationLongerThanGCD(chargeDObj)
-                        if isLong == true then
-                            return false  -- recharge > 2 s → show swipe
-                        elseif isLong == false then
-                            -- remaining ≤ 2 s: could be tail-end of recharge
-                            -- or GCD on a fully-charged spell — show swipe
-                            -- to be safe (avoids clipping last 2 s of recharge)
-                            return false
+                        local isNearZero = IsDurationNearZero(chargeDObj)
+                        if isNearZero == true then
+                            return true, "CHG-B:full(near-zero)"
+                        elseif isNearZero == false then
+                            rechargeDetected = true
                         end
                     end
                 end
-                -- Charge duration unavailable; for a known charge spell
-                -- default to showing swipe (safer than hiding recharge)
-                return false
+                if rechargeDetected then
+                    return false, "CHG-B:recharging(API)"
+                end
+                return false, "CHG-B:unknown=>show"
             end
+            -- Not cached and not readable as multi-charge → fall through to PATH 1
         end
     end
 
@@ -184,7 +284,7 @@ local function IsGCD(spellID, durationObject, hookDur)
             local gcdReadable = isOnGCD ~= nil
                 and not (issecretvalue and issecretvalue(isOnGCD))
             if gcdReadable then
-                return isOnGCD == true  -- definitive
+                return isOnGCD == true, "P1:isOnGCD=" .. tostring(isOnGCD)
             end
 
             -- isOnGCD is secret; check duration if readable
@@ -192,13 +292,13 @@ local function IsGCD(spellID, durationObject, hookDur)
                 and type(duration) == "number"
                 and not (issecretvalue and issecretvalue(duration))
             if durReadable then
-                if duration < 0.5 then return false end   -- off CD
-                if duration <= 1.0 then return true end   -- ≤ 1 s is always GCD
+                if duration < 0.5 then return false, "P1:dur=" .. duration .. "<0.5" end
+                if duration <= 1.0 then return true, "P1:dur=" .. duration .. "<=1.0" end
                 local gcd = GetGCDDuration()
                 if gcd and gcd > 0 and math.abs(duration - gcd) < 0.01 then
-                    return true  -- duration matches GCD exactly
+                    return true, "P1:dur=" .. duration .. "=gcd"
                 end
-                return false  -- longer than GCD → real CD
+                return false, "P1:dur=" .. duration .. ">gcd"
             end
         end
     end
@@ -209,13 +309,13 @@ local function IsGCD(spellID, durationObject, hookDur)
     if hookDur ~= nil then
         local isSecret = issecretvalue and issecretvalue(hookDur)
         if not isSecret and type(hookDur) == "number" then
-            if hookDur <= 0 then return false end         -- no cooldown
-            if hookDur <= 1.8 then return true end        -- GCD range
+            if hookDur <= 0 then return false, "P2:dur=" .. hookDur .. "<=0" end
+            if hookDur <= 1.8 then return true, "P2:dur=" .. hookDur .. "<=1.8" end
             local gcd = GetGCDDuration()
             if gcd and gcd > 0 and math.abs(hookDur - gcd) < 0.05 then
-                return true  -- matches GCD duration
+                return true, "P2:dur=" .. hookDur .. "=gcd"
             end
-            return false  -- longer than GCD → real CD
+            return false, "P2:dur=" .. hookDur .. ">gcd"
         end
     end
 
@@ -225,16 +325,16 @@ local function IsGCD(spellID, durationObject, hookDur)
     if durationObject then
         local isLong = IsDurationLongerThanGCD(durationObject)
         if isLong == true then
-            return false  -- remaining > 2 s → real CD
+            return false, "P3:curve>2s"
         elseif isLong == false then
-            return true   -- remaining ≤ 2 s → GCD
+            return true, "P3:curve<=2s"
         end
     end
 
     -- ==================================================================
     -- PATH 4: Can't determine → default to showing sweep (don't hide)
     -- ==================================================================
-    return false
+    return false, "P4:unknown=>show"
 end
 
 -- ============================================================================
@@ -333,7 +433,6 @@ local function HookCooldownFrame(cd, icon)
 
     -- ---------- SetCooldown (classic API) ----------
     hooksecurefunc(cd, "SetCooldown", function(self, start, dur)
-        -- Get a fresh Duration Object for the curve fallback
         local parentIcon = self._HGS_icon
         local spellID = parentIcon and GetSpellIDFromIcon(parentIcon)
         local dObj
@@ -342,7 +441,9 @@ local function HookCooldownFrame(cd, icon)
             if ok then dObj = d end
         end
 
-        if IsGCD(spellID, dObj, dur) then
+        local result, reason = IsGCD(spellID, dObj, dur)
+        D("SetCD ", spellID, " dur=", dur, " ", reason, result and " => HIDE" or "")
+        if result then
             SuppressSweep(self)
         end
     end)
@@ -352,7 +453,9 @@ local function HookCooldownFrame(cd, icon)
         hooksecurefunc(cd, "SetCooldownFromDurationObject", function(self, dObj)
             local parentIcon = self._HGS_icon
             local spellID = parentIcon and GetSpellIDFromIcon(parentIcon)
-            if IsGCD(spellID, dObj, nil) then
+            local result, reason = IsGCD(spellID, dObj, nil)
+            D("SetCDObj ", spellID, " ", reason, result and " => HIDE" or "")
+            if result then
                 SuppressSweep(self)
             end
         end)
@@ -372,7 +475,9 @@ local function HookCooldownFrame(cd, icon)
             if ok then dObj = d end
         end
 
-        if IsGCD(spellID, dObj, nil) then
+        local result, reason = IsGCD(spellID, dObj, nil)
+        D("Swipe+ ", spellID, " ", reason, result and " => RE-HIDE" or "")
+        if result then
             suppressingSwipe = true
             self:SetDrawSwipe(false)
             suppressingSwipe = false
@@ -393,7 +498,9 @@ local function HookCooldownFrame(cd, icon)
                 if ok then dObj = d end
             end
 
-            if IsGCD(spellID, dObj, nil) then
+            local result, reason = IsGCD(spellID, dObj, nil)
+            D("Edge+ ", spellID, " ", reason, result and " => RE-HIDE" or "")
+            if result then
                 suppressingEdge = true
                 self:SetDrawEdge(false)
                 suppressingEdge = false
@@ -411,6 +518,25 @@ local function ProcessViewer(globalName)
     if not viewer then return end
 
     for _, icon in ipairs(CollectIcons(viewer)) do
+        -- Cache charge spell status from the icon's actual spellID
+        local sid = GetSpellIDFromIcon(icon)
+        if sid and type(sid) == "number"
+           and not (issecretvalue and issecretvalue(sid))
+           and C_Spell and C_Spell.GetSpellCharges then
+            local cOk, cInfo = pcall(C_Spell.GetSpellCharges, sid)
+            if cOk and cInfo then
+                local m = cInfo.maxCharges
+                if m and type(m) == "number"
+                   and not (issecretvalue and issecretvalue(m))
+                   and m > 1 then
+                    if not chargeSpellCache[sid] then
+                        chargeSpellCache[sid] = true
+                        D("Cached charge spell", sid, "max=", m)
+                    end
+                end
+            end
+        end
+
         local cd = GetCooldownFrame(icon)
         if cd then
             HookCooldownFrame(cd, icon)
@@ -477,6 +603,7 @@ frame:RegisterEvent("SPELL_DATA_LOAD_RESULT")
 frame:SetScript("OnEvent", function(self, event)
     if event == "PLAYER_ENTERING_WORLD" then
         C_Timer.After(1, function()
+            PreScanChargeSpells()
             for _, name in ipairs(VIEWERS) do StartMonitoringViewer(name) end
             ProcessAllViewers()
         end)
@@ -490,8 +617,14 @@ frame:SetScript("OnEvent", function(self, event)
         scannerFrame:Hide()
         C_Timer.After(0.5, ProcessAllViewers)
 
-    elseif event == "PLAYER_SPECIALIZATION_CHANGED"
-        or event == "SPELL_DATA_LOAD_RESULT" then
+    elseif event == "PLAYER_SPECIALIZATION_CHANGED" then
+        wipe(chargeSpellCache)
+        C_Timer.After(0.5, function()
+            PreScanChargeSpells()
+            ProcessAllViewers()
+        end)
+
+    elseif event == "SPELL_DATA_LOAD_RESULT" then
         C_Timer.After(0.5, ProcessAllViewers)
     end
 end)
