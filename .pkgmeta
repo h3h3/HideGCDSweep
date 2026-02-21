@@ -1,6 +1,8 @@
 package-as: HideGCDSweep
 
 ignore:
-    - "*.gif"
-    - "*.md"
-    - "*.code-workspace"
+    - README.md
+    - AGENTS.md
+    - HideGCDSweep.code-workspace
+    - before.gif
+    - after.gif
