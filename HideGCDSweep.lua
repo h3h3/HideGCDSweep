@@ -15,9 +15,15 @@ local function dbg(fmt, ...)
 end
 
 hooksecurefunc("CooldownFrame_Set", function(self)
-    if not self or type(self) ~= "table" or not self.GetParent then return end
-    local parent = self:GetParent()
-    if not parent or not parent.RefreshSpellCooldownInfo then return end
+    if not self then return end
+    if issecrettable(self) then return end
+    if not self.GetParent then return end
+
+    local ok, parent = pcall(self.GetParent, self)
+    if not ok then return end
+
+    if not parent then return end
+    if not parent.RefreshSpellCooldownInfo then return end
 
     if parent.isOnGCD and not parent.wasSetFromCharges then
         self:SetDrawSwipe(false)
